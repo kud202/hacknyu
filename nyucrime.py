@@ -1,15 +1,19 @@
-from datetime import timedelta
+from datetime import timedelta, datetime
 from time import time
+import os
 
 import googlemaps
 import polyline
-from flask import Flask, g, jsonify, request
+from flask import Flask, g, jsonify, request, redirect, url_for, flash
 from elasticsearch import Elasticsearch, RequestsHttpConnection
 from aws_requests_auth.aws_auth import AWSRequestsAuth
-
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 app.config.from_envvar('CONFIG_FILE')
+
+
+ALLOWED_EXTENSIONS = {'csv'}
 
 
 def get_es():
@@ -44,8 +48,8 @@ def get_bounding_box(lat, lon):
         "geo_distance": {
             "distance": app.config['CRIME_PROXIMITY'],
             "location": {
-                "lat": lat,
-                "lon": lon
+                "lat": lon,
+                "lon": lat
             }
         }
     }
@@ -64,6 +68,22 @@ def make_query(points):
             }
         }
     }
+
+
+def allowed_file(filename):
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+def get_weight_for_crime(req_time, crime):
+    req_time = datetime.fromtimestamp(req_time)
+    t1 = req_time.hour
+    t2 = crime[u'hour']
+    w_hour = 10-(min((t1 - t2) % 24, (t2 - t1) % 24)*10.0/12)
+    t1 = req_time.month
+    t2 = crime[u'month']
+    w_month = 10-(min((t1 - t2) % 12, (t2 - t1) % 12)*10.0/6)
+    return (10*crime[u'crime_weight'] + 5*w_hour + 2*w_month)/170.0
 
 
 @app.route('/')
@@ -115,7 +135,13 @@ def get_routes():
                         points = points + polyline.decode(step[u'polyline'][u'points'])
             query = make_query(points)
             results = get_es().search(index=app.config['INDEX_NAME'], body=query)
-            crime_per_meter = len(results[u'hits'][u'hits']) / dist
+            crime_per_meter = sum([
+                get_weight_for_crime(
+                    departure + time_offset.seconds,
+                    c[u'_source']
+                ) for c in results[u'hits'][u'hits']
+            ]) / dist
+            # crime_per_meter = len(results[u'hits'][u'hits']) / dist
             response['routes'].append({
                 "polyline": r[u'overview_polyline'][u'points'],
                 "departure_offset": time_offset.seconds,
@@ -124,6 +150,36 @@ def get_routes():
             })
         time_offset += timedelta(hours=1)
     return jsonify(response)
+
+
+@app.route('/', methods=['GET', 'POST'])
+def upload_file():
+    if request.method == 'POST':
+        # check if the post request has the file part
+        if 'file' not in request.files:
+            flash('No file part')
+            return redirect(request.url)
+        csv_file = request.files['file']
+        # if user does not select file, browser also
+        # submit a empty part without filename
+        if csv_file.filename == '':
+            flash('No selected file')
+            return redirect(request.url)
+        if csv_file and allowed_file(csv_file.filename):
+            filename = secure_filename(csv_file.filename)
+            csv_file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
+            return redirect(url_for('uploaded_file',
+                                    filename=filename))
+    return '''
+    <!doctype html>
+    <title>Upload new data file.</title>
+    <h1>Upload new data file (must be csv)</h1>
+    <form method=post enctype=multipart/form-data>
+      <p><input type=file name=file>
+         <input type=submit value=Upload>
+    </form>
+    '''
+
 
 if __name__ == '__main__':
     app.run()
