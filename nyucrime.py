@@ -55,9 +55,10 @@ def get_bounding_box(lat, lon):
     }
 
 
-def make_query(points):
+def make_query(points,frm=0):
     return {
         "size": 10000,
+        "from": frm,
         "query": {
             "bool": {
                 "must": {
@@ -133,20 +134,30 @@ def get_routes():
                     if step[u'travel_mode'] == "WALKING":
                         dist = dist + step[u'distance'][u'value']
                         points = points + polyline.decode(step[u'polyline'][u'points'])
-            query = make_query(points)
-            results = get_es().search(index=app.config['INDEX_NAME'], body=query)
+
+            query_offset = 0
+            crimes = []
+            while True:
+                query = make_query(points, query_offset)
+                results = get_es().search(index=app.config['INDEX_NAME'], body=query)
+                crimes += results[u'hits'][u'hits']
+                if len(results[u'hits'][u'hits']) == 10000:
+                    query_offset += 10000
+                    continue
+                else:
+                    break
             crime_per_meter = sum([
                 get_weight_for_crime(
                     departure + time_offset.seconds,
                     c[u'_source']
-                ) for c in results[u'hits'][u'hits']
+                ) for c in crimes
             ]) / dist
             # crime_per_meter = len(results[u'hits'][u'hits']) / dist
             response['routes'].append({
                 "polyline": r[u'overview_polyline'][u'points'],
                 "departure_offset": time_offset.seconds,
                 "crime_rate": crime_per_meter,
-                "crime_locations": [hit[u'_source'][u'location'] for hit in results[u'hits'][u'hits']]
+                "crime_locations": [hit[u'_source'][u'location'] for hit in crimes]
             })
         time_offset += timedelta(hours=1)
     return jsonify(response)
